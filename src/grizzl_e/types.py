@@ -1,122 +1,142 @@
 from __future__ import annotations
 
+import locale
+import operator
 from dataclasses import dataclass
 from datetime import time
 from decimal import Decimal
+from functools import cached_property
+from typing import TYPE_CHECKING, TypeVar
+
+if TYPE_CHECKING:
+    from .document import BaseDocument
+    from .device import BaseDevice
+
+DocT = TypeVar("DocT", bound="BaseDocument")
+DeviceT = TypeVar("DeviceT", bound="BaseDevice")
 
 
-def _time_to_minutes(t: time) -> int:
-    """Convert a time to minutes from midnight."""
-    return t.hour * 60 + t.minute
+class Currency(Decimal):
+    def __str__(self):
+        return locale.currency(self, grouping=True)
 
 
-def _minutes_to_time(m: int) -> time:
-    """Convert minutes from midnight to a time object."""
-    return time(hour=m // 60, minute=m % 60)
-
-
+@dataclass(repr=False, eq=False, frozen=True, slots=True)
 class TimeRange:
-    """A time-of-day range, supporting midnight wraparound.
-
-    The range is half-open: [lower, upper).
-    When lower == upper, the range is disabled (empty).
-    When lower is time.min and upper is time.max, the range is always active.
-    """
-
-    __slots__ = ("lower", "upper")
-
-    def __init__(self, lower: time, upper: time) -> None:
-        self.lower = lower
-        self.upper = upper
+    lower: time
+    upper: time
 
     @property
-    def is_disabled(self) -> bool:
-        return self.lower == self.upper
-
-    @property
-    def is_always_active(self) -> bool:
-        return self.lower == time.min and self.upper == time.max
-
-    def _to_intervals(self) -> list[tuple[int, int]]:
-        """Convert to a list of (start_minutes, end_minutes) intervals.
-
-        A range crossing midnight (e.g. 22:00-06:00) becomes two intervals.
-        A disabled range (lower == upper) returns an empty list.
-        """
-        if self.is_disabled:
-            return []
-
-        lower = _time_to_minutes(self.lower)
-        upper = _time_to_minutes(self.upper)
-
-        if lower == upper:
-            return []
-        if lower < upper:
-            return [(lower, upper)]
-        # Wraps midnight
-        return [(lower, 1440), (0, upper)]
-
-    def __contains__(self, t: time) -> bool:
-        if self.is_disabled:
-            return False
-        t_minutes = _time_to_minutes(t)
-        for start, end in self._to_intervals():
-            if start <= t_minutes < end:
-                return True
-        return False
-
-    def overlaps(self, other: TimeRange) -> bool:
-        """Check if this range overlaps with another."""
-        if self.is_disabled or other.is_disabled:
-            return False
-        for s_start, s_end in self._to_intervals():
-            for o_start, o_end in other._to_intervals():
-                if s_start < o_end and o_start < s_end:
-                    return True
-        return False
-
-    def intersection(self, other: TimeRange) -> TimeRange | None:
-        """Return the overlapping period, or None if no overlap."""
-        if not self.overlaps(other):
-            return None
-
-        best_start = 0
-        best_end = 1440
-
-        for s_start, s_end in self._to_intervals():
-            for o_start, o_end in other._to_intervals():
-                if s_start < o_end and o_start < s_end:
-                    best_start = max(best_start, max(s_start, o_start))
-                    best_end = min(best_end, min(s_end, o_end))
-
-        return TimeRange(_minutes_to_time(best_start), _minutes_to_time(best_end))
+    def upper_inc(self):
+        return self.upper is time.max
 
     def __repr__(self) -> str:
         return f"{self.__class__.__name__}({self.lower!r}, {self.upper!r})"
 
     def __str__(self) -> str:
-        if self.is_disabled:
-            return "disabled"
-        return f"{self.lower.strftime('%H:%M')}-{self.upper.strftime('%H:%M')}"
-
-    def __eq__(self, other: object) -> bool:
-        if not isinstance(other, TimeRange):
-            return NotImplemented
-        return self.lower == other.lower and self.upper == other.upper
+        upper_bound = "]" if self.upper_inc else ")"
+        return f"[{self.lower}-{self.upper}{upper_bound}"
 
     def __hash__(self) -> int:
         return hash((self.lower, self.upper))
 
+    def __contains__(self, other) -> bool:
+        if isinstance(other, type(self)):
+            return self & other == other
+        if not isinstance(other, time):
+            raise TypeError
 
-@dataclass(frozen=True)
-class Rate:
-    name: str
-    value: Decimal
-    time_range: TimeRange
+        op = operator.le if self.upper_inc else operator.lt
+        return other >= self.lower and op(other, self.upper)
+
+    def __eq__(self, other) -> bool:
+        if not isinstance(other, type(self)):
+            return NotImplemented
+        return self.lower == other.lower and self.upper == other.upper
+
+    def __and__(self, other) -> TimeRange | None:
+        if not isinstance(other, type(self)):
+            return NotImplemented
+
+        if self.lower < other.upper and other.lower < self.upper:
+            return self.__class__(
+                max(self.lower, other.lower),
+                min(self.upper, other.upper),
+            )
+        return None
 
 
-@dataclass(frozen=True)
-class Conflict:
-    rates: tuple[str, str]
-    overlap: TimeRange
-    message: str
+@dataclass(repr=False, eq=False, frozen=True)
+class WraparoundTimeRange:
+    """A time-of-day range, supporting midnight wraparound."""
+
+    lower: time | None = None
+    upper: time | None = None
+
+    @cached_property
+    def ranges(self) -> tuple[TimeRange] | tuple[TimeRange, TimeRange]:
+        lower = self.lower or time.min
+        upper = self.upper or time.max
+
+        if lower < upper:
+            return TimeRange(lower, upper),
+        else:
+            return TimeRange(lower, time.max), TimeRange(time.min, upper)
+
+    def __post_init__(self) -> None:
+        if None not in (self.lower, self.upper) and self.lower == self.upper:
+            raise ValueError
+
+    def __repr__(self) -> str:
+        return f"{self.__class__.__name__}({self.lower!r}, {self.upper!r})"
+
+    def __str__(self) -> str:
+        return f"({self.lower or 'Unbound'}-{self.upper or 'Unbound'})"
+
+    def __hash__(self) -> int:
+        return hash(self.ranges)
+
+    def __contains__(self, other) -> bool:
+        if isinstance(other, type(self) | TimeRange):
+            return self & other == other
+        if not isinstance(other, time):
+            raise TypeError
+        return any(other in r for r in self.ranges)
+
+    def __eq__(self, other) -> bool:
+        if not isinstance(other, type(self)):
+            return NotImplemented
+        return self.ranges == other.ranges
+
+    def __and__(self, other) -> WraparoundTimeRange | None:
+        if isinstance(other, type(self)):
+            other = other.ranges
+        elif isinstance(other, TimeRange):
+            other = (other,)
+        else:
+            return NotImplemented
+
+        lower: time | None = None
+        upper: time | None = None
+
+        for a in other:
+            for b in self.ranges:
+                intersection = a & b
+                if intersection is None:
+                    continue
+                if lower is None:
+                    lower = intersection.lower
+                upper = intersection.upper
+
+        if lower and upper:
+            try:
+                return self.__class__(
+                    lower if lower != time.min else None,
+                    upper if upper != time.max else None,
+                )
+            except ValueError:
+                if lower == upper:
+                    pass
+                else:
+                    raise
+        return None

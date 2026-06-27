@@ -3,18 +3,24 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
-from ..managers import Manager
-
-if TYPE_CHECKING:
-    from ..client import Client
+from .base import Manager
+from ..document import Document
 
 logger = logging.getLogger(__name__)
 
 
-class NetworkManager(Manager):
+class NetworkManager(Manager[Document, Any]):
     """Read and write network configuration (AP, HTTP auth, STA WiFi)."""
+
+    fields: set[str] = {
+        "ssidNameAP", "ssidPasswordAP", "ssidName", "ssidPassword",
+        "httpUsername", "httpPassword", "WifiMode", "mac_bind", "STA_MAC",
+    }
+
+    def on_fields_changed(self, doc: Document, changed_fields: set[str]) -> None:
+        pass
 
     # ------------------------------------------------------------------
     # Read helpers
@@ -22,7 +28,7 @@ class NetworkManager(Manager):
 
     async def get_config(self) -> dict[str, Any]:
         """Return a dict of all network-related fields from the current document."""
-        doc = await self._client.get_document()
+        doc = await self._device.client.get_document()
         return {
             "ssidNameAP": doc.ssidNameAP,
             "ssidPasswordAP": doc.ssidPasswordAP,

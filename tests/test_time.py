@@ -67,33 +67,40 @@ def client(mock_session):
 
 class TestGetTime:
     async def test_returns_timezone_aware_datetime(self, client, mock_session):
+        await client.refresh()
+        client._document = None
         mock_session.post.return_value.json = AsyncMock(
             return_value=_doc_with_time(time_zone=-5, system_time=1753986403)
         )
-        dt = await client.time.get_time()
+        dt = await client.device.time.get_time()
         assert dt.tzinfo is not None
         assert dt.utcoffset() == timedelta(hours=-5)
 
     async def test_positive_timezone_offset(self, client, mock_session):
+        await client.refresh()
+        client._document = None
         mock_session.post.return_value.json = AsyncMock(
             return_value=_doc_with_time(time_zone=5, system_time=0)
         )
-        dt = await client.time.get_time()
+        dt = await client.device.time.get_time()
         assert dt.utcoffset() == timedelta(hours=5)
 
     async def test_utc_timezone(self, client, mock_session):
+        await client.refresh()
+        client._document = None
         mock_session.post.return_value.json = AsyncMock(
             return_value=_doc_with_time(time_zone=0, system_time=1000000)
         )
-        dt = await client.time.get_time()
+        dt = await client.device.time.get_time()
         assert dt.utcoffset() == timedelta(0)
 
 
 class TestSetTime:
     async def test_sets_timezone_and_timestamp(self, client, mock_session):
+        await client.refresh()
         tz = timezone(timedelta(hours=-5))
         dt = datetime(2025, 8, 1, 12, 0, 0, tzinfo=tz)
-        await client.time.set_time(dt)
+        await client.device.time.set_time(dt)
         call_data = mock_session.post.call_args.kwargs["data"]
         assert call_data["timeZone"] == -5
         assert call_data["systemTime"] == int(dt.timestamp())
@@ -101,11 +108,11 @@ class TestSetTime:
     async def test_naive_datetime_raises(self, client, mock_session):
         dt = datetime(2025, 8, 1, 12, 0, 0)
         with pytest.raises(ValueError, match="timezone-aware"):
-            await client.time.set_time(dt)
+            await client.device.time.set_time(dt)
 
     async def test_different_timezones(self, client, mock_session):
         tz = timezone(timedelta(hours=3))
         dt = datetime(2025, 8, 1, 12, 0, 0, tzinfo=tz)
-        await client.time.set_time(dt)
+        await client.device.time.set_time(dt)
         call_data = mock_session.post.call_args.kwargs["data"]
         assert call_data["timeZone"] == 3

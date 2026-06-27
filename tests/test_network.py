@@ -136,7 +136,8 @@ def mock_session():
 class TestGetConfig:
     async def test_returns_all_network_fields(self, mock_session):
         c = Client("http://192.168.1.1", session=mock_session)
-        config = await c.network.get_config()
+        await c.refresh()
+        config = await c.device.network.get_config()
         assert config["ssidNameAP"] == "MyAP"
         assert config["ssidPasswordAP"] == "ap123456"
         assert config["ssidName"] == "HomeWiFi"
@@ -151,7 +152,8 @@ class TestGetConfig:
 class TestSetAP:
     async def test_writes_ap_fields(self, mock_session):
         c = Client("http://192.168.1.1", session=mock_session)
-        await c.network.set_ap("NewAP", "newap12345")
+        await c.refresh()
+        await c.device.network.set_ap("NewAP", "newap12345")
         call_data = mock_session.post.call_args.kwargs["data"]
         assert call_data["ssidNameAP"] == "NewAP"
         assert call_data["ssidPasswordAP"] == "newap12345"
@@ -159,13 +161,13 @@ class TestSetAP:
 
     async def test_defaults_conf_to_password(self, mock_session):
         c = Client("http://192.168.1.1", session=mock_session)
-        await c.network.set_ap("NewAP", "mypassword")
+        await c.device.network.set_ap("NewAP", "mypassword")
         call_data = mock_session.post.call_args.kwargs["data"]
         assert call_data["ssidPasswordAPConf"] == "mypassword"
 
     async def test_accepts_explicit_conf(self, mock_session):
         c = Client("http://192.168.1.1", session=mock_session)
-        await c.network.set_ap("NewAP", "mypassword", "explicit")
+        await c.device.network.set_ap("NewAP", "mypassword", "explicit")
         call_data = mock_session.post.call_args.kwargs["data"]
         assert call_data["ssidPasswordAPConf"] == "explicit"
 
@@ -183,7 +185,7 @@ class TestSetHTTP:
         with patch("grizzl_e.client.ClientSession") as MockSession:
             MockSession.return_value = session
             c = Client("http://192.168.1.1", session=session)
-            await c.network.set_http("newuser", "newpass123")
+            await c.device.network.set_http("newuser", "newpass123")
             assert session.post.call_count == 1
             call_data = session.post.call_args.kwargs["data"]
             assert call_data["httpUsername"] == "newuser"
@@ -202,7 +204,7 @@ class TestSetHTTP:
         with patch("grizzl_e.client.ClientSession") as MockSession:
             MockSession.return_value = session
             c = Client("http://192.168.1.1", session=session)
-            await c.network.set_http("user", "mypass")
+            await c.device.network.set_http("user", "mypass")
             call_data = session.post.call_args.kwargs["data"]
             assert call_data["httpPasswordConf"] == "mypass"
 
@@ -212,7 +214,7 @@ class TestSetHTTP:
 class TestSetSTA:
     async def test_writes_required_fields(self, mock_session):
         c = Client("http://192.168.1.1", session=mock_session)
-        await c.network.set_sta("MyWiFi", "wifipass123")
+        await c.device.network.set_sta("MyWiFi", "wifipass123")
         call_data = mock_session.post.call_args.kwargs["data"]
         assert call_data["ssidName"] == "MyWiFi"
         assert call_data["ssidPassword"] == "wifipass123"
@@ -220,7 +222,7 @@ class TestSetSTA:
 
     async def test_writes_optional_fields(self, mock_session):
         c = Client("http://192.168.1.1", session=mock_session)
-        await c.network.set_sta(
+        await c.device.network.set_sta(
             "MyWiFi",
             "wifipass123",
             wifi_mode=2,
@@ -234,7 +236,7 @@ class TestSetSTA:
 
     async def test_defaults_conf_to_password(self, mock_session):
         c = Client("http://192.168.1.1", session=mock_session)
-        await c.network.set_sta("MyWiFi", "wifipass123")
+        await c.device.network.set_sta("MyWiFi", "wifipass123")
         call_data = mock_session.post.call_args.kwargs["data"]
         assert call_data["ssidPasswordConf"] == "wifipass123"
 
@@ -242,4 +244,4 @@ class TestSetSTA:
 class TestNetworkProperty:
     async def test_returns_network_manager(self, mock_session):
         c = Client("http://192.168.1.1", session=mock_session)
-        assert isinstance(c.network, NetworkManager)
+        assert isinstance(c.device.network, NetworkManager)

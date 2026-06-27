@@ -1,0 +1,52 @@
+[project]
+name = "grizzl-e-local"
+version = "0.0.1"
+description = "A client for interacting with Grizzl-E EVSE local smart features"
+readme = "README.md"
+license = { text="MIT" }
+authors = [
+    { name="Nolan Stover", email="nolan@nolsto.com" },
+]
+requires-python = ">=3.12"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+    "aiohttp",
+    "aiozoneinfo",
+    "pydantic",
+]
+
+[build-system]
+requires = ["uv_build>=0.11.19,<0.12.0"]
+build-backend = "uv_build"
+
+[project.urls]
+Homepage = "https://github.com/nolsto/grizzl-e-local"
+Issues = "https://github.com/nolsto/grizzl-e-local/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+target-version = "py312"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.pyrefly]
+project-includes = [
+    "**/*.py*",
+    "**/*.ipynb",
+]
+
+[dependency-groups]
+dev = [
+    "grizzl-e-local",
+    "pytest>=9.1.0",
+    "pytest-asyncio>=1.0.0",
+    "ruff>=0.15.17",
+]

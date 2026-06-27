@@ -2,46 +2,22 @@ from __future__ import annotations
 
 import asyncio
 import pickle
+from collections import defaultdict
 from collections.abc import AsyncGenerator
+from functools import cached_property
 from pathlib import Path
-from typing import Any, overload
+from typing import Any, Generic
 
-from aiohttp import ClientSession, encode_basic_auth
+import aiohttp
+from aiohttp import ClientSession
 
-from . import managers
-from .document import Document
-
-_GET_PATH = "/main"
-_SET_PATH = "/pageEvent"
-_INIT_PATH = "/init"
-
-
-class _LazyManager:
-    """Descriptor for lazy-initializing manager instances."""
-
-    def __init__(self, cls: type) -> None:
-        self._cls = cls
-
-    def __set_name__(self, owner: type, name: str) -> None:
-        self._attr = f"_{name}"
-
-    @overload
-    def __get__(self, obj: None, objtype: None) -> _LazyManager: ...
-
-    @overload
-    def __get__(self, obj: Client, objtype: type) -> object: ...
-
-    def __get__(self, obj: Client | None, objtype: type | None = None):
-        if obj is None:
-            return self
-        mgr = getattr(obj, self._attr, None)
-        if mgr is None:
-            mgr = self._cls(obj)
-            setattr(obj, self._attr, mgr)
-        return mgr  # type: ignore[return-value]
+from .constants import GET_PATH, INIT_PATH, SET_PATH
+from .device import DependencyGraph, Device
+from .document import Document, ValidationError
+from .types import DocT, DeviceT
 
 
-class Client:
+class Client(Generic[DocT, DeviceT]):
     """Async client for the Grizzl-E EVSE device.
 
     Usage::
@@ -49,11 +25,14 @@ class Client:
         async with Client("http://192.168.20.101") as c:
             doc = await c.get_document()
             print(doc.state)
-            await c.set("evseEnabled", 1)
+            await c.set("evseEnabled", True)
 
             async for doc in c.watch(1.0):
                 print(doc.currentSet)
     """
+
+    document_class: type[DocT] = Document  # type: ignore[assignment]
+    device_class: type[DeviceT] = Device  # type: ignore[assignment]
 
     def __init__(
         self,
@@ -64,33 +43,14 @@ class Client:
         password: str = "",
     ) -> None:
         self._host = host.rstrip("/")
-        self._session = session
+        self._session: ClientSession | None = session
         self._username = username
         self._password = password
-        self._doc_cache: Document | None = None
+        self._document: DocT | None = None
+        self._expired_document: DocT | None = None
         self._init_data: dict[str, Any] | None = None
         self._state_file = Path(state_file) if state_file else None
-        self._tariffs: managers.TariffManager | None = None
-        self._limits: managers.LimitsManager | None = None
-        self._time: managers.TimeManager | None = None
-        self._network: managers.NetworkManager | None = None
-
-    async def _get_session(self) -> ClientSession:
-        if self._session is None or self._session.closed:
-            headers = {}
-            if self._username:
-                headers["Authorization"] = encode_basic_auth(self._username, self._password)
-            self._session = ClientSession(headers=headers if headers else None)
-        return self._session
-
-    async def _invalidate_session(self) -> None:
-        """Close the current session so the next request creates a new one with auth."""
-        await self.close()
-        self._session = None
-
-    async def close(self) -> None:
-        if self._session is not None and not self._session.closed:
-            await self._session.close()
+        self._validators = self.document_class.validators[:]
 
     async def __aenter__(self) -> Client:
         return self
@@ -98,68 +58,128 @@ class Client:
     async def __aexit__(self, *args: Any) -> None:
         await self.close()
 
-    async def get_document(self) -> Document:
+    @property
+    def session(self) -> ClientSession:
+        if self._session is None or self._session.closed:
+            headers = {}
+            if self._username:
+                headers["Authorization"] = aiohttp.encode_basic_auth(
+                    self._username, self._password,
+                )
+            self._session = ClientSession(headers=headers if headers else None)
+        return self._session
+
+    @cached_property
+    def device(self) -> Any:
+        dependencies = DependencyGraph()
+        return self.device_class(self, dependencies).state
+
+    @property
+    def document(self) -> DocT:
+        """The cached or expired document"""
+        if self._document is None:
+            if self._expired_document is None:
+                raise RuntimeError(
+                    "Document not yet fetched. Call refresh() or get_document() first.",
+                )
+            return self._expired_document
+        return self._document
+
+    @property
+    def is_valid(self) -> bool:
+        doc = self._document
+        if doc is None:
+            return True
+        try:
+            for validator in self._validators:
+                validator(doc)
+            return True
+        except ValidationError:
+            return False
+
+    def _expire_document(self) -> None:
+        if self._document is None:
+            return
+        self._expired_document = self._document
+        self._document = None
+
+    async def get_document(self) -> DocT:
         """Fetch the full device document. Uses a cached copy if available."""
-        if self._doc_cache is None:
+        if self._document is None:
             await self.refresh()
-        assert self._doc_cache is not None
-        return self._doc_cache
+        assert self._document is not None
+        return self._document
 
-    async def refresh(self) -> None:
+    async def get(self, key: str) -> Any:
+        """Async, ensures fresh document, returns a single field."""
+        doc = await self.get_document()
+        return getattr(doc, key)
+
+    async def refresh(self, full: bool = False) -> None:
         """Force a refresh of the main device document from the network."""
-        session = await self._get_session()
-        resp = await session.post(f"{self._host}{_GET_PATH}")
-        resp.raise_for_status()
-        main_data = await resp.json()
-        data = self._merge_init(main_data)
-        self._doc_cache = Document(**data)
+        old_doc = self._document
 
-    def _merge_init(self, main_data: dict[str, Any]) -> dict[str, Any]:
-        """Merge cached init data into main data, main takes precedence."""
-        if self._init_data is None:
-            return main_data
-        return {**self._init_data, **main_data}
+        if full or self._init_data is None:
+            init_data, main_data = await asyncio.gather(
+                self.fetch_data(INIT_PATH),
+                self.fetch_data(GET_PATH),
+            )
+            self._init_data = init_data
+        else:
+            main_data = await self.fetch_data(GET_PATH)
+        data = {**self._init_data, **main_data}
+        self._document = self.document_class(**data)
 
-    async def init(self) -> Document:
-        """Fetch both main and init documents, returning a merged Document."""
-        session = await self._get_session()
-
-        resp_main = await session.post(f"{self._host}{_GET_PATH}")
-        resp_main.raise_for_status()
-        main_data = await resp_main.json()
-
-        resp_init = await session.post(f"{self._host}{_INIT_PATH}")
-        resp_init.raise_for_status()
-        init_data = await resp_init.json()
-
-        # Merge: init fields first, main fields override overlapping keys
-        merged = {**init_data, **main_data}
-        self._init_data = init_data
-        self._doc_cache = Document(**merged)
-        return self._doc_cache
+        if old_doc is not None:
+            if diff := old_doc.diff(self._document):
+                self.device.node.on_fields_changed(diff)
 
     async def refresh_init(self) -> None:
         """Force a refresh of the init (network config) document."""
-        session = await self._get_session()
-        resp = await session.post(f"{self._host}{_INIT_PATH}")
+        self._init_data = await self.fetch_data(INIT_PATH)
+
+    async def fetch_data(self, path: str) -> dict[str, Any]:
+        resp = await self.session.post(f"{self._host}{path}")
         resp.raise_for_status()
-        self._init_data = await resp.json()
+        return await resp.json()
 
     async def set(self, key: str, value: Any) -> None:
         """Set a single device key. No read, no validation."""
         await self.set_many(**{key: value})
 
-    async def set_many(self, /, **data: Any) -> None:
-        """Set multiple device keys in a single request. No read, no validation."""
-        session = await self._get_session()
-        await session.post(f"{self._host}{_SET_PATH}", data=data)
-        # Invalidate cache since we modified state
-        self._doc_cache = None
-        # Device reboots when HTTP credentials change — invalidate session
-        if "httpUsername" in data or "httpPassword" in data:
-            await self._invalidate_session()
+    def _get_field_endpoint(self, field: str) -> str:
+        field_info = self.document_class.model_fields.get(field)
+        if field_info is None:
+            return SET_PATH
+        meta = field_info.json_schema_extra
+        if meta is None:
+            return SET_PATH
+        return meta.get("endpoint", SET_PATH)  # type: ignore[union-attr]
 
-    async def watch(self, interval: float = 1.0) -> AsyncGenerator[Document, None]:
+    async def set_many(self, /, **data: Any) -> None:
+        """Set multiple device keys in a single request. Runs validators."""
+        if not data:
+            return
+        if self._document is not None:
+            current = self._document.model_dump()
+            merged = {**current, **data}
+            validated = self.document_class(**merged)
+            for validator in self._validators:
+                if validator.fields & data.keys():
+                    validator(validated)
+        by_endpoint: dict[str, dict[str, Any]] = defaultdict(dict)
+        for key, value in data.items():
+            endpoint = self._get_field_endpoint(key)
+            by_endpoint[endpoint][key] = value
+        await asyncio.gather(
+            *[self.session.post(f"{self._host}{endpoint}", data=chunk)
+              for endpoint, chunk in by_endpoint.items()]
+        )
+        self._expire_document()
+        if "httpUsername" in data or "httpPassword" in data:
+            await self.close()
+
+    async def watch(self, interval: float = 1.0) -> AsyncGenerator[DocT, None]:
         """Poll the device at the given interval, yielding the document each time.
 
         The caller is responsible for breaking out of the loop.
@@ -175,7 +195,7 @@ class Client:
         """
         if self._state_file is None:
             raise RuntimeError("No state_file configured")
-        data = {}
+        data: dict[str, Any] = {}
         if self._state_file.exists():
             with open(self._state_file, "rb") as f:
                 data = pickle.load(f)
@@ -193,33 +213,7 @@ class Client:
             data = pickle.load(f)
         return data[key]
 
-    @property
-    def is_valid(self) -> bool:
-        """Check if the current document satisfies all invariants."""
-        doc = self._doc_cache
-        if doc is None:
-            return True  # nothing to validate
-
-        if doc.currentSet > doc.curDesign:
-            return False
-
-        # AP WiFi password: empty or >= 8 chars
-        pwd = doc.ssidPasswordAP
-        if pwd and len(pwd) < 8:
-            return False
-
-        # STA WiFi password: empty or >= 8 chars
-        pwd = doc.ssidPassword
-        if pwd and len(pwd) < 8:
-            return False
-
-        # HTTP: can't have password without username
-        if doc.httpUsername == "" and doc.httpPassword != "":
-            return False
-
-        return True
-
-    tariffs = _LazyManager(managers.TariffManager)
-    limits = _LazyManager(managers.LimitsManager)
-    time = _LazyManager(managers.TimeManager)
-    network = _LazyManager(managers.NetworkManager)
+    async def close(self) -> None:
+        if self._session is not None and not self._session.closed:
+            await self._session.close()
+        self._session = None
