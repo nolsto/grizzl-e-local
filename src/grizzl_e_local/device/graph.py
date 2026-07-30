@@ -3,22 +3,18 @@ from __future__ import annotations
 from collections.abc import Iterable
 from contextlib import suppress
 from functools import cached_property, reduce
-from typing import Generic, Protocol, TypeVar
+from typing import Protocol
 from weakref import WeakKeyDictionary, WeakSet
 
 
-class NamedAttr(Protocol):
-    attr_name: str
-
-
-T = TypeVar("T", bound=NamedAttr)
-
-
-class DependencyGraph(Generic[T]):
+class DependencyGraph[T]:
     nodes: WeakKeyDictionary[T, WeakSet[T]]
 
     def __init__(self):
         self.nodes = WeakKeyDictionary()
+
+    def __getitem__(self, node: T) -> WeakSet[T]:
+        return self.nodes[node]
 
     def __iter__(self):
         yield from self.sorted
@@ -28,40 +24,37 @@ class DependencyGraph(Generic[T]):
 
     @cached_property
     def sorted(self) -> list[T]:
-        "Topological sort from least depended on to most"
+        """Topological sort: dependencies appear after the nodes that depend on them."""
 
         if not self.nodes:
             return []
 
-        # Nodes dependent on others. Each occurrence originates from a distinct dependency.
-        dependents: list[T] = reduce(lambda x, y: [*x, *y], self.nodes.values(), [])
-        # Nodes not dependent on any others
-        nodes = set(self.nodes.keys()).difference(dependents)
+        # in-degree = number of dependencies each node has.
+        in_degree: dict[T, int] = {node: len(deps) for node, deps in self.nodes.items()}
 
+        # Start with nodes that have no dependencies (depend on nothing).
+        queue: list[T] = [node for node, deg in in_degree.items() if deg == 0]
         result: list[T] = []
 
-        while nodes:
-            node = nodes.pop()
+        while queue:
+            node = queue.pop(0)
             result.append(node)
 
-            if not dependents:
-                if result.count(node) > 1:
-                    raise RuntimeError(
-                        f"{self} requires all nodes to be dependent a single root node"
-                    )
-                break
-            for dep in self.nodes[node]:
-                dependents.remove(dep)
-                if dep not in dependents:
-                    nodes.add(dep)
+            # For each node that depends on the current one, decrease its in-degree.
+            for dependent in self.inverted.get(node, set()):
+                in_degree[dependent] -= 1
+                if in_degree[dependent] == 0:
+                    queue.append(dependent)
 
         if len(result) != len(self.nodes):
             raise RuntimeError(f"{self} contains a cyclic dependency")
 
-        return result
+        return list(reversed(result))
 
     @cached_property
     def inverted(self) -> WeakKeyDictionary[T, WeakSet[T]]:
+        """Inverts the graph: node key maps to a set of nodes dependent on it"""
+
         result = WeakKeyDictionary[T, WeakSet[T]]()
 
         for node, dependents in self.nodes.items():
@@ -79,7 +72,7 @@ class DependencyGraph(Generic[T]):
             del self.inverted
 
     def add(self, a: T, b: T) -> None:
-        "Add dependency. A depends on B"
+        """Add dependency. A depends on B"""
 
         if b not in self.nodes:
             self.nodes[b] = WeakSet()
@@ -89,14 +82,20 @@ class DependencyGraph(Generic[T]):
         self._invalidate_cache()
 
     def remove(self, a: T, b: T) -> None:
-        "Remove dependency. A no longer depends on B"
+        """Remove dependency. A no longer depends on B"""
 
         if a in self.nodes and b in self.nodes[a]:
             self.nodes[a].remove(b)
             self._invalidate_cache()
 
+
+class NamedAttr(Protocol):
+    attr_name: str
+
+
+class NamedAttrDependencyGraph[T: NamedAttr](DependencyGraph[T]):
     def ascend(self, path: Iterable[str]) -> T:
-        "Traverse dependencies from root node"
+        """Traverse dependencies from root node"""
 
         path = list(path)
         if not path:

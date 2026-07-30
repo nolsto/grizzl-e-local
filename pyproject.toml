@@ -15,8 +15,7 @@ classifiers = [
 ]
 dependencies = [
     "aiohttp",
-    "aiozoneinfo",
-    "pydantic",
+    "aiorwlock>=1.5.1",
 ]
 
 [build-system]
@@ -42,6 +41,14 @@ project-includes = [
     "**/*.py*",
     "**/*.ipynb",
 ]
+
+[tool.uv.workspace]
+members = [
+    ".",
+]
+
+[tool.uv.sources]
+grizzl-e-local = { workspace = true, editable = true }
 
 [dependency-groups]
 dev = [

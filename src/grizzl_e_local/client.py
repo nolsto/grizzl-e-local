@@ -1,19 +1,19 @@
 from __future__ import annotations
 
 import asyncio
-import pickle
 from collections import defaultdict
 from collections.abc import AsyncGenerator
-from functools import cached_property
-from pathlib import Path
+from contextlib import asynccontextmanager
 from typing import Any, Generic
 
 import aiohttp
 from aiohttp import ClientSession
+from aiorwlock import RWLock
 
-from .constants import GET_PATH, INIT_PATH, SET_PATH
+from .constants import Endpoint
+from .context import transaction_batch
 from .device import DependencyGraph, Device
-from .document import Document, ValidationError
+from .document import Document
 from .types import DocT, DeviceT
 
 
@@ -38,7 +38,6 @@ class Client(Generic[DocT, DeviceT]):
         self,
         host: str,
         session: ClientSession | None = None,
-        state_file: str | Path | None = None,
         username: str = "",
         password: str = "",
     ) -> None:
@@ -49,14 +48,28 @@ class Client(Generic[DocT, DeviceT]):
         self._document: DocT | None = None
         self._expired_document: DocT | None = None
         self._init_data: dict[str, Any] | None = None
-        self._state_file = Path(state_file) if state_file else None
-        self._validators = self.document_class.validators[:]
+        self._locks = {e: RWLock() for e in Endpoint}
+        self._device: DeviceT = self.device_class(self, DependencyGraph())
 
     async def __aenter__(self) -> Client:
         return self
 
     async def __aexit__(self, *args: Any) -> None:
         await self.close()
+
+    @asynccontextmanager
+    async def transaction(self, refresh=False):
+        batch: dict[str, object] = {}
+        token = transaction_batch.set(batch)
+
+        try:
+            yield batch
+        finally:
+            transaction_batch.reset(token)
+            if batch:
+                await self.set_many(**batch)
+                if refresh:
+                    await self.refresh()
 
     @property
     def session(self) -> ClientSession:
@@ -69,10 +82,9 @@ class Client(Generic[DocT, DeviceT]):
             self._session = ClientSession(headers=headers if headers else None)
         return self._session
 
-    @cached_property
+    @property
     def device(self) -> Any:
-        dependencies = DependencyGraph()
-        return self.device_class(self, dependencies).state
+        return self._device.state
 
     @property
     def document(self) -> DocT:
@@ -87,15 +99,7 @@ class Client(Generic[DocT, DeviceT]):
 
     @property
     def is_valid(self) -> bool:
-        doc = self._document
-        if doc is None:
-            return True
-        try:
-            for validator in self._validators:
-                validator(doc)
-            return True
-        except ValidationError:
-            return False
+        return self.document.is_valid()
 
     def _expire_document(self) -> None:
         if self._document is None:
@@ -110,7 +114,9 @@ class Client(Generic[DocT, DeviceT]):
         assert self._document is not None
         return self._document
 
-    async def get(self, key: str) -> Any:
+    get_data = get_document
+
+    async def get(self, key: str) -> object:
         """Async, ensures fresh document, returns a single field."""
         doc = await self.get_document()
         return getattr(doc, key)
@@ -121,60 +127,62 @@ class Client(Generic[DocT, DeviceT]):
 
         if full or self._init_data is None:
             init_data, main_data = await asyncio.gather(
-                self.fetch_data(INIT_PATH),
-                self.fetch_data(GET_PATH),
+                self.fetch_data(Endpoint.INIT),
+                self.fetch_data(Endpoint.GET),
             )
             self._init_data = init_data
         else:
-            main_data = await self.fetch_data(GET_PATH)
+            main_data = await self.fetch_data(Endpoint.GET)
         data = {**self._init_data, **main_data}
         self._document = self.document_class(**data)
 
         if old_doc is not None:
             if diff := old_doc.diff(self._document):
-                self.device.node.on_fields_changed(diff)
+                for component in self._device.dependencies:
+                    if fields := component.fields & diff:
+                        component.on_fields_changed(fields)
 
     async def refresh_init(self) -> None:
         """Force a refresh of the init (network config) document."""
-        self._init_data = await self.fetch_data(INIT_PATH)
+        self._init_data = await self.fetch_data(Endpoint.INIT)
 
-    async def fetch_data(self, path: str) -> dict[str, Any]:
-        resp = await self.session.post(f"{self._host}{path}")
+    async def fetch_data(self, endpoint: Endpoint) -> dict[str, object]:
+        async with self._locks[endpoint].reader_lock:  # type: ignore[bad-context-manager]
+            resp = await self.session.post(f"{self._host}{endpoint.value}")
         resp.raise_for_status()
         return await resp.json()
 
-    async def set(self, key: str, value: Any) -> None:
+    async def post_data(self, endpoint: Endpoint, data: dict[str, object]) -> None:
+        async with self._locks[endpoint].writer_lock:  # type: ignore[bad-context-manager]
+            await self.session.post(f"{self._host}{endpoint.value}", data=data)
+
+    async def set(self, key: str, value: object) -> None:
         """Set a single device key. No read, no validation."""
         await self.set_many(**{key: value})
 
-    def _get_field_endpoint(self, field: str) -> str:
-        field_info = self.document_class.model_fields.get(field)
-        if field_info is None:
-            return SET_PATH
-        meta = field_info.json_schema_extra
-        if meta is None:
-            return SET_PATH
-        return meta.get("endpoint", SET_PATH)  # type: ignore[union-attr]
-
-    async def set_many(self, /, **data: Any) -> None:
-        """Set multiple device keys in a single request. Runs validators."""
+    async def set_many(self, /, **data: object) -> None:
+        """Set multiple device keys in a single request. Validates independently."""
         if not data:
             return
+        try:
+            batch = transaction_batch.get()
+        except LookupError:
+            pass
+        else:
+            batch.update(data)
+            return
+        doc = self.document_class()
         if self._document is not None:
-            current = self._document.model_dump()
-            merged = {**current, **data}
-            validated = self.document_class(**merged)
-            for validator in self._validators:
-                if validator.fields & data.keys():
-                    validator(validated)
-        by_endpoint: dict[str, dict[str, Any]] = defaultdict(dict)
+            doc.update(self._document)
+        doc.update(data)
+        serialized = doc.serialize()
+        doc.run_validators()
+        by_endpoint: dict[Endpoint, dict[str, object]] = defaultdict(dict)
         for key, value in data.items():
-            endpoint = self._get_field_endpoint(key)
-            by_endpoint[endpoint][key] = value
-        await asyncio.gather(
-            *[self.session.post(f"{self._host}{endpoint}", data=chunk)
-              for endpoint, chunk in by_endpoint.items()]
-        )
+            endpoint = doc.get_endpoint(key)
+            serialized_value = serialized.get(key, value)
+            by_endpoint[endpoint][key] = serialized_value
+        await asyncio.gather(*(self.post_data(ep, payload) for ep, payload in by_endpoint.items()))
         self._expire_document()
         if "httpUsername" in data or "httpPassword" in data:
             await self.close()
@@ -187,31 +195,6 @@ class Client(Generic[DocT, DeviceT]):
         while True:
             yield await self.get_document()
             await asyncio.sleep(interval)
-
-    def save_state(self, key: str, value: Any) -> None:
-        """Persist a value to the state file.
-
-        Raises RuntimeError if no state_file was provided.
-        """
-        if self._state_file is None:
-            raise RuntimeError("No state_file configured")
-        data: dict[str, Any] = {}
-        if self._state_file.exists():
-            with open(self._state_file, "rb") as f:
-                data = pickle.load(f)
-        data[key] = value
-        with open(self._state_file, "wb") as f:
-            pickle.dump(data, f)
-
-    def load_state(self, key: str) -> Any:
-        """Load a value from the state file."""
-        if self._state_file is None:
-            raise RuntimeError("No state_file configured")
-        if not self._state_file.exists():
-            raise KeyError(key)
-        with open(self._state_file, "rb") as f:
-            data = pickle.load(f)
-        return data[key]
 
     async def close(self) -> None:
         if self._session is not None and not self._session.closed:

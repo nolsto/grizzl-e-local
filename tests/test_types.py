@@ -2,13 +2,15 @@ from datetime import time
 
 import pytest
 
-from grizzl_e.types import TimeRange, WraparoundTimeRange
+from grizzl_e_local.types.ranges import TimeRange, WraparoundTimeRange
 
 
 class TestWraparoundTimeRangeBasic:
-    def test_invalid_range(self):
-        with pytest.RaisesExc(ValueError):
-            WraparoundTimeRange(time(6, 0), time(6, 0))
+    def test_zero_length_range(self):
+        """Zero-length ranges (same start/end) produce empty intervals."""
+        tr = WraparoundTimeRange(time(6, 0), time(6, 0))
+        assert len(tr.ranges) == 0
+        assert time(12, 0) not in tr
 
     def test_unbound_range(self):
         tr = WraparoundTimeRange()

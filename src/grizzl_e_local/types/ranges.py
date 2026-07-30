@@ -1,24 +1,10 @@
 from __future__ import annotations
 
-import locale
 import operator
 from dataclasses import dataclass
-from datetime import time
-from decimal import Decimal
+from datetime import datetime, date, time, timedelta
 from functools import cached_property
-from typing import TYPE_CHECKING, TypeVar
-
-if TYPE_CHECKING:
-    from .document import BaseDocument
-    from .device import BaseDevice
-
-DocT = TypeVar("DocT", bound="BaseDocument")
-DeviceT = TypeVar("DeviceT", bound="BaseDevice")
-
-
-class Currency(Decimal):
-    def __str__(self):
-        return locale.currency(self, grouping=True)
+from typing import Literal
 
 
 @dataclass(repr=False, eq=False, frozen=True, slots=True)
@@ -73,20 +59,6 @@ class WraparoundTimeRange:
     lower: time | None = None
     upper: time | None = None
 
-    @cached_property
-    def ranges(self) -> tuple[TimeRange] | tuple[TimeRange, TimeRange]:
-        lower = self.lower or time.min
-        upper = self.upper or time.max
-
-        if lower < upper:
-            return TimeRange(lower, upper),
-        else:
-            return TimeRange(lower, time.max), TimeRange(time.min, upper)
-
-    def __post_init__(self) -> None:
-        if None not in (self.lower, self.upper) and self.lower == self.upper:
-            raise ValueError
-
     def __repr__(self) -> str:
         return f"{self.__class__.__name__}({self.lower!r}, {self.upper!r})"
 
@@ -94,7 +66,7 @@ class WraparoundTimeRange:
         return f"({self.lower or 'Unbound'}-{self.upper or 'Unbound'})"
 
     def __hash__(self) -> int:
-        return hash(self.ranges)
+        return hash((self.lower, self.upper))
 
     def __contains__(self, other) -> bool:
         if isinstance(other, type(self) | TimeRange):
@@ -135,8 +107,31 @@ class WraparoundTimeRange:
                     upper if upper != time.max else None,
                 )
             except ValueError:
-                if lower == upper:
-                    pass
-                else:
+                if lower != upper:
                     raise
         return None
+
+    @cached_property
+    def ranges(self) -> tuple[()] | tuple[TimeRange] | tuple[TimeRange, TimeRange]:
+        lower = self.lower or time.min
+        upper = self.upper or time.max
+
+        if lower == upper:
+            return ()
+        elif lower < upper:
+            return TimeRange(lower, upper),
+        else:
+            return TimeRange(lower, time.max), TimeRange(time.min, upper)
+
+    def timedelta(
+        self,
+        resolution: Literal["hours", "minutes", "seconds", "milliseconds", "microseconds"] = "seconds"
+    ) -> timedelta:
+        d = date.today()
+        td = timedelta(**{resolution: 1})
+        return timedelta(**{
+            resolution: sum(
+                (datetime.combine(d, r.upper) - datetime.combine(d, r.lower)) // td
+                for r in self.ranges
+            )
+        })
