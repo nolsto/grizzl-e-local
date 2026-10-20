@@ -35,17 +35,19 @@ target-version = "py312"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
-
-[tool.pyrefly]
-project-includes = [
-    "**/*.py*",
-    "**/*.ipynb",
+addopts = "-m 'not integration'"
+markers = [
+    "integration: end-to-end tests requiring a live device",
 ]
+
+[tool.pyright]
+pythonVersion = "3.12"
+typeCheckingMode = "basic"
+reportMissingImports = true
+reportMissingTypeStubs = false
 
 [tool.uv.workspace]
-members = [
-    ".",
-]
+members = ["."]
 
 [tool.uv.sources]
 grizzl-e-local = { workspace = true, editable = true }

@@ -146,13 +146,9 @@ class TestNodeExceptionHandling:
         assert node.exceptions == []
 
     def test_exception_state_captures_state_errors(self):
-        from grizzl_e_local.device.base import StateError
-
         node = _make_node()
-
         with node.exception_state():
             raise StateError("state error 1")
-
         assert len(node.exceptions) >= 1
 
 

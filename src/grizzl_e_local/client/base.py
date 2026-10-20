@@ -4,35 +4,34 @@ import asyncio
 from collections import defaultdict
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
-from typing import Any, Generic
+from typing import Any, Generic, Self
 
 import aiohttp
 from aiohttp import ClientSession
 from aiorwlock import RWLock
 
-from .constants import Endpoint
-from .context import transaction_batch
-from .device import DependencyGraph, Device
-from .document import Document
-from .types import DocT, DeviceT
+from ..constants import Endpoint
+from ..context import transaction_batch
+from ..device.base import DependencyGraph
+from ..types import DocT, DeviceT
 
 
-class Client(Generic[DocT, DeviceT]):
+class BaseClient(Generic[DocT, DeviceT]):
     """Async client for the Grizzl-E EVSE device.
 
     Usage::
 
-        async with Client("http://192.168.20.101") as c:
-            doc = await c.get_document()
-            print(doc.state)
+        async with Client("http://192.168.4.1") as c:
             await c.set("evseEnabled", True)
 
+            print(await c.get("sessionTime"))
+
             async for doc in c.watch(1.0):
-                print(doc.currentSet)
+                print(doc.voltMeas1)
     """
 
-    document_class: type[DocT] = Document  # type: ignore[assignment]
-    device_class: type[DeviceT] = Device  # type: ignore[assignment]
+    document_class: type[DocT]
+    device_class: type[DeviceT]
 
     def __init__(
         self,
@@ -51,7 +50,7 @@ class Client(Generic[DocT, DeviceT]):
         self._locks = {e: RWLock() for e in Endpoint}
         self._device: DeviceT = self.device_class(self, DependencyGraph())
 
-    async def __aenter__(self) -> Client:
+    async def __aenter__(self) -> Self:
         return self
 
     async def __aexit__(self, *args: Any) -> None:
@@ -83,7 +82,7 @@ class Client(Generic[DocT, DeviceT]):
         return self._session
 
     @property
-    def device(self) -> Any:
+    def device(self):
         return self._device.state
 
     @property
@@ -123,7 +122,7 @@ class Client(Generic[DocT, DeviceT]):
 
     async def refresh(self, full: bool = False) -> None:
         """Force a refresh of the main device document from the network."""
-        old_doc = self._document
+        old_doc = self._document or self._expired_document
 
         if full or self._init_data is None:
             init_data, main_data = await asyncio.gather(
@@ -171,21 +170,22 @@ class Client(Generic[DocT, DeviceT]):
         else:
             batch.update(data)
             return
+        data = {key: value() if callable(value) else value for key, value in data.items()}
         doc = self.document_class()
         if self._document is not None:
             doc.update(self._document)
         doc.update(data)
-        serialized = doc.serialize()
         doc.run_validators()
         by_endpoint: dict[Endpoint, dict[str, object]] = defaultdict(dict)
         for key, value in data.items():
             endpoint = doc.get_endpoint(key)
-            serialized_value = serialized.get(key, value)
-            by_endpoint[endpoint][key] = serialized_value
+            by_endpoint[endpoint][key] = value
         await asyncio.gather(*(self.post_data(ep, payload) for ep, payload in by_endpoint.items()))
         self._expire_document()
         if "httpUsername" in data or "httpPassword" in data:
             await self.close()
+            self._username = data.get("httpUsername", "")
+            self._password = data.get("httpPassword", "")
 
     async def watch(self, interval: float = 1.0) -> AsyncGenerator[DocT, None]:
         """Poll the device at the given interval, yielding the document each time.

@@ -1,12 +1,11 @@
 from __future__ import annotations
 
-import inspect
 import collections
+import inspect
 from typing import TYPE_CHECKING, ClassVar
 
 from ..constants import Endpoint
 from ..util import extract_base_type
-from .fields import FIELD_CONVERSIONS
 from .validation import ValidationError
 
 if TYPE_CHECKING:
@@ -14,7 +13,7 @@ if TYPE_CHECKING:
 
 
 class BaseDocument(collections.UserDict):
-    """Runtime document base — accepts complex types, normalizes on storage."""
+    """Stores document fields in their on-device representation (str, int or float)."""
 
     validators: ClassVar[list[Validator]] = []
 
@@ -33,14 +32,7 @@ class BaseDocument(collections.UserDict):
     def __setitem__(self, key: str, item: object) -> None:
         if key not in type(self).get_field_types():
             raise KeyError(f"unknown field: {key}")
-
-        if callable(item):
-            source = item
-            def resolve():
-                return self.normalize(key, source())
-            item = resolve
-        else:
-            item = self.normalize(key, item)
+        self.check(key, item)
         self.data[key] = item
 
     def diff(self, other: BaseDocument) -> set[str]:
@@ -59,21 +51,6 @@ class BaseDocument(collections.UserDict):
         except ValidationError:
             return False
 
-    def serialize(self) -> dict[str, object]:
-        result = {}
-        field_types = type(self).get_field_types()
-        for key, value in self.data.items():
-            if callable(value):
-                value = value()
-            raw_hint = field_types.get(key)
-            if raw_hint is None:
-                continue
-            py_type, _metadata = extract_base_type(raw_hint)
-            entry = FIELD_CONVERSIONS.get(py_type)
-            if isinstance(value, py_type):
-                result[key] = entry[1](value) if entry else value
-        return result
-
     @classmethod
     def get_endpoint(cls, field_name: str) -> Endpoint:
         resolved = inspect.get_annotations(cls, eval_str=True).get(field_name)
@@ -86,9 +63,9 @@ class BaseDocument(collections.UserDict):
         return Endpoint.SET
 
     @classmethod
-    def get_field_types(cls) -> dict[str, object]:
+    def get_field_types(cls) -> dict[str, type | None]:
         if '_field_types_cache' not in cls.__dict__:
-            result: dict[str, object] = {}
+            result: dict[str, type | None] = {}
             for name, resolved in inspect.get_annotations(cls, eval_str=True).items():
                 if name == 'validators':
                     continue
@@ -100,31 +77,26 @@ class BaseDocument(collections.UserDict):
         return cls._field_types_cache
 
     @classmethod
-    def normalize(cls, key: str, value: object) -> object:
-        field_types = cls.get_field_types()
-        raw_hint = field_types.get(key)
-        if raw_hint is None:
-            return value
-        py_type, _metadata = extract_base_type(raw_hint)
+    def check(cls, key: str, value: object) -> None:
+        try:
+            py_type = cls.get_field_types()[key]
+        except KeyError as e:
+            raise KeyError(f"unknown field: {key}") from e
+        if py_type is None:
+            if value is py_type:
+                return
+            raise ValueError(f"{key}: expected None, got {value}")
         if isinstance(value, py_type):
-            return value
-        entry = FIELD_CONVERSIONS.get(py_type)
-        if entry is None:
-            try:
-                return py_type(value)
-            except (TypeError, ValueError):
-                raise ValueError(
-                    f"{key}: expected {py_type.__name__}, got {type(value).__name__}"
-                ) from None
-        deserializer, _, *raw_types = entry
-        if not raw_types or not isinstance(value, tuple(raw_types)):
-            raise ValueError(
-                f"{key}: expected {py_type.__name__} or"
-                f" {tuple(t.__name__ for t in raw_types)}, got {type(value).__name__}"
-            )
-        return deserializer(value)
+            return
+        # JSON numbers without a fractional part parse as int even on float fields.
+        if py_type is float and type(value) is int:
+            return
+        raise ValueError(
+            f"{key}: expected {py_type.__name__}, got {type(value).__name__}"
+        )
 
     @classmethod
     def validate(cls, data: dict[str, object]) -> None:
         for key, value in data.items():
-            cls.normalize(key, value)
+            if cls.get_field_types().get(key) is not None:
+                cls.check(key, value)

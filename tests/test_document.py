@@ -1,5 +1,3 @@
-from datetime import time, timezone, tzinfo
-from decimal import Decimal
 from typing import Annotated
 
 import pytest
@@ -9,103 +7,70 @@ from grizzl_e_local.document.base import BaseDocument
 from grizzl_e_local.document.validation import ValidationError
 
 
-class _TimeDoc(BaseDocument):
-    tarifAStart: time
-    tarifAStop: time
+class _MinutesDoc(BaseDocument):
+    tarifAStart: int  # minutes from midnight, interpreted by the device layer
+    tarifAStop: int
 
 
-class _BoolDoc(BaseDocument):
-    ground: bool
-    enabled: bool
-
-
-class _DecimalDoc(BaseDocument):
-    rate: Decimal
-    amount: Decimal
-
-
-class _TzDoc(BaseDocument):
-    timeZone: tzinfo
+class _FlagsDoc(BaseDocument):
+    ground: int
+    enabled: int
 
 
 class _MixedDoc(BaseDocument):
     name: str
-    tarifAStart: time
-    ground: bool
-    tarifValue: Decimal
-    timeZone: tzinfo
+    tarifAStart: int
+    ground: int
+    totalEnergy: float
 
     validators = []
 
 
+class TestRawStorage:
+    def test_values_stored_as_received(self):
+        doc = _MinutesDoc(tarifAStart=960, tarifAStop=1200)
+        assert doc.tarifAStart == 960
+        assert doc.tarifAStop == 1200
 
-class TestNormalization:
-    def test_time_field_normalized(self):
-        doc = _TimeDoc(tarifAStart=960, tarifAStop=1200)
-        assert doc.tarifAStart == time(16, 0)
-        assert doc.tarifAStop == time(20, 0)
+    def test_flags_store_zero_one_ints(self):
+        doc = _FlagsDoc(ground=1, enabled=0)
+        assert doc.ground == 1
+        assert doc.enabled == 0
 
-    def test_time_field_passes_through_when_already_correct(self):
-        doc = _TimeDoc(tarifAStart=time(8, 30), tarifAStop=1200)
-        assert doc.tarifAStart == time(8, 30)
-
-    def test_bool_field_normalized(self):
-        doc = _BoolDoc(ground=1, enabled=0)
-        assert doc.ground is True
-        assert doc.enabled is False
-
-    def test_decimal_fields_normalized(self):
-        doc = _DecimalDoc(rate=36, amount=3)
-        assert doc.rate == Decimal("0.36")
-        assert doc.amount == Decimal("0.03")
-
-    def test_tzinfo_field_normalized(self):
-        doc = _TzDoc(timeZone=-5)
-        assert isinstance(doc.timeZone, timezone)
-        assert doc.timeZone.utcoffset(None).total_seconds() == -5 * 3600
-
+    def test_strings_stored_as_is(self):
+        doc = _MixedDoc(name="test", tarifAStart=960, ground=1, totalEnergy=3.5)
+        assert doc.name == "test"
 
 
 class TestValidation:
-    def test_invalid_int_for_time_raises(self):
+    def test_string_for_int_field_raises(self):
         with pytest.raises(ValueError, match="tarifAStart"):
-            _TimeDoc(tarifAStart="not_a_number", tarifAStop=0)
+            _MinutesDoc(tarifAStart="not_a_number", tarifAStop=0)
 
-    def test_invalid_type_for_bool_raises(self):
-        with pytest.raises(ValueError, match="ground"):
-            _BoolDoc(ground="not_an_int", enabled=1)
-
-    def test_invalid_int_for_decimal_raises(self):
-        with pytest.raises(ValueError, match="rate"):
-            _DecimalDoc(rate="bad", amount=0)
+    def test_int_for_str_field_raises(self):
+        with pytest.raises(ValueError, match="name"):
+            _MixedDoc(name=1, tarifAStart=0, ground=0, totalEnergy=0.0)
 
     def test_classmethod_validate(self):
-        _TimeDoc.validate({"tarifAStart": 960})
+        _MinutesDoc.validate({"tarifAStart": 960})
 
         with pytest.raises(ValueError, match="tarifAStop"):
-            _TimeDoc.validate({"tarifAStop": "bad"})
+            _MinutesDoc.validate({"tarifAStop": "bad"})
+
+    def test_validate_ignores_unknown_fields(self):
+        # Firmware may add fields after a device update; ingest must not crash.
+        _MinutesDoc.validate({"unknownField": 1})
 
 
+class TestFloatTolerance:
+    def test_int_value_accepted_for_float_field(self):
+        # JSON numbers without a fractional part parse as int even on float fields.
+        doc = BaseDocument.__subclasses__() and None or None
+        class EnergyDoc(BaseDocument):
+            totalEnergy: float
 
-class TestSerialization:
-    def test_serialize_converts_back_to_device_format(self):
-        doc = _MixedDoc(
-            name="test",
-            tarifAStart=time(16, 0),
-            ground=1,
-            tarifValue=36,
-            timeZone=-5,
-        )
-        serialized = doc.serialize()
-        assert serialized["tarifAStart"] == 960
-        assert serialized["ground"] == 1
-        assert isinstance(serialized["tarifValue"], int)
-
-    def test_serialize_omits_unknown_fields(self):
-        doc = _MixedDoc(name="test", tarifAStart=960, ground=0, tarifValue=0, timeZone=0)
-        serialized = doc.serialize()
-        assert "unknownField" not in serialized
-
+        doc = EnergyDoc(totalEnergy=5)
+        assert doc.totalEnergy == 5
 
 
 class TestEndpointDetection:
@@ -126,9 +91,8 @@ class TestEndpointDetection:
         assert Doc.get_endpoint("secret").name == "CONFIG_AP"
 
 
-
 class TestValidators:
-    def test_custom_validator_fails(self):
+    def _validator(self):
         class Validator:
             fields = {"value"}
 
@@ -136,123 +100,58 @@ class TestValidators:
                 if getattr(doc, "value", 0) > 100:
                     raise ValidationError("too high")
 
+        return Validator()
+
+    def test_custom_validator_fails(self):
         class Doc(BaseDocument):
             value: int
-            validators = [Validator()]
+            validators = [self._validator()]
 
         doc = Doc(value=200)
         with pytest.raises(ValidationError, match="too high"):
             doc.run_validators()
+        assert not doc.is_valid()
 
     def test_all_validators_pass_with_good_data(self):
-        class Validator:
-            fields = {"value"}
-
-            def __call__(self, doc):
-                if getattr(doc, "value", 0) > 100:
-                    raise ValidationError("too high")
-
         class Doc(BaseDocument):
             value: int
-            validators = [Validator()]
+            validators = [self._validator()]
 
         doc = Doc(value=50)
         doc.run_validators()
+        assert doc.is_valid()
 
 
 class TestDiff:
     def test_diff_returns_changed_fields(self):
-        doc1 = _MixedDoc(name="a", tarifAStart=960, ground=1, tarifValue=36, timeZone=0)
-        doc2 = _MixedDoc(name="b", tarifAStart=960, ground=1, tarifValue=36, timeZone=0)
+        doc1 = _MixedDoc(name="a", tarifAStart=960, ground=1, totalEnergy=3.5)
+        doc2 = _MixedDoc(name="b", tarifAStart=960, ground=1, totalEnergy=3.5)
         assert doc1.diff(doc2) == {"name"}
 
     def test_diff_empty_when_identical(self):
-        doc1 = _MixedDoc(name="a", tarifAStart=960, ground=1, tarifValue=36, timeZone=0)
-        doc2 = _MixedDoc(name="a", tarifAStart=960, ground=1, tarifValue=36, timeZone=0)
+        doc1 = _MixedDoc(name="a", tarifAStart=960, ground=1, totalEnergy=3.5)
+        doc2 = _MixedDoc(name="a", tarifAStart=960, ground=1, totalEnergy=3.5)
         assert doc1.diff(doc2) == set()
 
 
-
 class TestMutation:
-    def test_setitem_normalizes(self):
-        doc = _TimeDoc(tarifAStart=0, tarifAStop=0)
+    def test_setitem_stores_raw_value(self):
+        doc = _MinutesDoc(tarifAStart=0, tarifAStop=0)
         doc.tarifAStart = 1080
-        assert doc.tarifAStart == time(18, 0)
+        assert doc.tarifAStart == 1080
 
-    def test_setitem_validates_before_normalizing(self):
-        doc = _TimeDoc(tarifAStart=0, tarifAStop=0)
+    def test_setitem_rejects_wrong_type(self):
+        doc = _MinutesDoc(tarifAStart=0, tarifAStop=0)
         with pytest.raises(ValueError, match="tarifAStart"):
             doc.tarifAStart = "bad"
 
     def test_dot_access_delegates_to_dict(self):
-        doc = _MixedDoc(name="test", tarifAStart=960, ground=1, tarifValue=36, timeZone=0)
+        doc = _MixedDoc(name="test", tarifAStart=960, ground=1, totalEnergy=3.5)
         assert doc.name == "test"
         with pytest.raises(AttributeError):
             _ = doc.nonexistent_field
 
     def test_unknown_field_raises_keyerror(self):
-        doc = _MixedDoc(name="test", tarifAStart=960, ground=1, tarifValue=36, timeZone=0)
+        doc = _MixedDoc(name="test", tarifAStart=960, ground=1, totalEnergy=3.5)
         with pytest.raises(KeyError, match="unknown field"):
             doc.unknownField = "fail"
-
-
-class TestLazyEvaluation:
-    def test_callable_stores_resolver(self):
-        class Doc(BaseDocument):
-            value: int
-
-        def make_value():
-            return 42
-
-        doc = Doc()
-        doc.value = make_value
-        assert callable(doc.data["value"])
-        assert doc.serialize() == {"value": 42}
-
-    def test_serialization_calls_callable(self):
-        class Doc(BaseDocument):
-            value: int
-
-        def make_value():
-            return 42
-
-        doc = Doc()
-        doc.value = make_value
-        assert doc.serialize() == {"value": 42}
-
-    def test_serialization_resolves_multiple_times(self):
-        class Doc(BaseDocument):
-            value: int
-
-        counter = [0]
-        def make_value():
-            counter[0] += 1
-            return counter[0]
-
-        doc = Doc()
-        doc.value = make_value
-        assert doc.serialize() == {"value": 1}
-        assert doc.serialize() == {"value": 2}
-
-    def test_lazy_callable_raises_normalize_error(self):
-        class Doc(BaseDocument):
-            value: int
-
-        def bad_value():
-            return "not_an_int"
-
-        doc = Doc()
-        doc.value = bad_value
-        with pytest.raises(ValueError, match="value"):
-            doc.serialize()
-
-    def test_diff_compares_raw_callables(self):
-        class Doc(BaseDocument):
-            value: int
-
-        doc1 = Doc()
-        doc2 = Doc()
-        doc1.value = lambda: 1
-        doc2.value = lambda: 2
-        # Different callable objects are structurally different
-        assert doc1.diff(doc2) == {"value"}

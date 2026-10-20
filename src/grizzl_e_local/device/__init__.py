@@ -1,4 +1,4 @@
-from .base import BaseDevice, DependencyGraph
-from .versions import Device
+from .base import BaseDevice
+from .versions import Version_01 as Device
 
-__all__ = ["BaseDevice", "DependencyGraph", "Device"]
+__all__ = ["BaseDevice", "Device"]

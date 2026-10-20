@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from contextlib import suppress
-from functools import cached_property, reduce
+from functools import cached_property
 from typing import Protocol
 from weakref import WeakKeyDictionary, WeakSet
 

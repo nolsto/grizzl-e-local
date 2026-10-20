@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import logging
 from collections.abc import Callable
 from contextlib import contextmanager
@@ -8,6 +9,7 @@ from typing import TYPE_CHECKING, Any, Protocol, cast, overload
 
 from ..util import flatten_exceptions
 from ..context import transaction_batch
+from .state import State as StateProtocol
 from .graph import NamedAttrDependencyGraph as DependencyGraph
 
 if TYPE_CHECKING:
@@ -27,7 +29,7 @@ class State[T: Node]:
         self._node = node
 
 
-class LazyAttrState[T: Node](State[T]):
+class LazyAttrState[T: Node](State[T], StateProtocol):
     """Base State for Node with lazy attributes.
 
     Delegates attribute reads and writes to the Node. Provides async methods
@@ -82,17 +84,17 @@ class LazyAttrsClass(type):
 
 
 class NodeBase(LazyAttrsClass):
-    state_factory: Callable[["NodeBase"], Any]
-    get_state_args: Callable[["NodeBase"], tuple[tuple, dict[str, Any]]]
+    state_factory: Callable[..., Any]
+    get_state_args: Callable[..., tuple[tuple, dict[str, Any]]]
 
     def __new__(cls, name, bases, namespace: dict[str, Any], **kwargs):
         state_class: type | None = None
-        if "State" in namespace and isinstance(namespace["State"], type):
+        if "State" in namespace and inspect.isclass(namespace["State"]):
             state_class = cast(type, namespace.pop("State"))
         if "state_factory" in namespace:
             if state_class:
                 raise ValueError("State class and state_factory must not both be defined.")
-            if isinstance(namespace["state_factory"], type):
+            if inspect.isclass(namespace["state_factory"]):
                 state_class = cast(type, namespace.pop("state_factory"))
 
         new_class = super().__new__(cls, name, bases, namespace, **kwargs)
@@ -106,7 +108,11 @@ class NodeBase(LazyAttrsClass):
             state_bases = (LazyAttrState,)
             if state_class:
                 state_bases = (state_class, *state_bases)
-            state_class = type(name + "State", state_bases, {"_lazy_attrs": lazy_attrs})
+            state_class = type(
+                name + "State",
+                state_bases,
+                {"_lazy_attrs": lazy_attrs, "__module__": "grizzl_e_local.device"},
+            )
 
         if state_class:
             if issubclass(state_class, State) and 'get_state_args' not in namespace:
@@ -133,7 +139,7 @@ class Node[T](metaclass=NodeBase):
     field_args: tuple[str, ...]
     field_kwargs: dict[str, str]
     attr_name: str
-    state_factory: Callable[..., T]
+    state_factory: Callable[..., T] | None
 
     def __init__(
         self,
@@ -210,8 +216,6 @@ class Node[T](metaclass=NodeBase):
 
     def validate_state(self) -> None:
         # Override to provide additional validation logic (beyond document field validation).
-        # An invalid state should ensure `self.in_exception_state == True` at the end of this
-        # method. Use `with self.exception_state():` to capture `StateError`s.
         pass
 
     def get_field_value(self, field: str) -> Any:
@@ -239,7 +243,7 @@ class Node[T](metaclass=NodeBase):
         await self.client.set_many(**fields)
 
 
-class BaseDevice(Node):
+class BaseDevice[T](Node[T]):
     attr_name = 'device'
 
 
@@ -295,12 +299,12 @@ class MutableDeviceComponent[T](DeviceComponent[T]):
         )
 
 
-def component_from_type[T, N: Node](wrapped: type[T], component_class: type[N]) -> type[N]:
-    return type(
+def component_from_type[T, N: Node](wrapped: type[T], component_class: type[N] = DeviceComponent):
+    return cast(type[N], type(
         wrapped.__name__ + component_class.__name__,
         (component_class,),
         {'state_factory': wrapped}
-    )
+    ))
 
 class _Mutable(Protocol):
     def __call__[T](self, t: type[T]) -> type[MutableDeviceComponent[T]]: ...
@@ -341,14 +345,14 @@ class DeviceAttribute[T]:
         owner._lazy_attrs.add(name)
 
     @overload
-    def __get__(self, obj: None, objtype: None) -> DeviceAttribute: ...
+    def __get__(self, obj: None, objtype: None) -> DeviceAttribute[T]: ...
 
     @overload
     def __get__(self, obj: Node, objtype: type) -> T: ...
 
     def __get__(
         self, obj: Node | None, objtype: type | None = None
-    ) -> T | DeviceAttribute:
+    ) -> T | DeviceAttribute[T]:
         if obj is None:
             return self
         try:

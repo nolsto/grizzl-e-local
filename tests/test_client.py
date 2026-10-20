@@ -3,6 +3,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from grizzl_e_local.client import Client
+from grizzl_e_local.client.versions import Version_01
 from grizzl_e_local.document.base import BaseDocument
 from grizzl_e_local.document.validation import ValidationError
 from grizzl_e_local.document.versions import HttpAuthValidator
@@ -204,7 +205,7 @@ class TestHTTPAuth:
         session.post.return_value.raise_for_status = MagicMock()
         session.post.return_value.json = AsyncMock(return_value={})
 
-        with patch("grizzl_e_local.client.ClientSession") as MockSession:
+        with patch("grizzl_e_local.client.base.ClientSession") as MockSession:
             MockSession.return_value = session
             class Doc(BaseDocument):
                 httpUsername: str
@@ -227,7 +228,7 @@ class TestHTTPAuth:
         session.post.return_value.json = AsyncMock(return_value={})
 
 
-        with patch("grizzl_e_local.client.ClientSession") as MockSession:
+        with patch("grizzl_e_local.client.base.ClientSession") as MockSession:
             MockSession.return_value = session
             class Doc(BaseDocument):
                 httpUsername: str
@@ -362,3 +363,75 @@ class TestTransactionBatching:
         await c.set_many(ssidNameAP="newSSID")
 
         assert session.post.call_count == 1
+
+    async def test_set_many_resolves_lazy_values(self, session):
+        class Doc(BaseDocument):
+            systemTime: int
+            timeZone: int
+
+        calls = [0]
+
+        def make_epoch():
+            calls[0] += 1
+            return 1750000000 + calls[0]
+
+        c = _ClientWithDoc("http://192.168.1.1", session=session, document_class=Doc)
+
+        await c.set_many(systemTime=make_epoch, timeZone=lambda: -5)
+
+        call_args = session.post.call_args_list[-1]
+        data = call_args[1].get("data") or call_args[1].get("json", {})
+        assert data["systemTime"] == 1750000001
+        assert data["timeZone"] == -5
+        # Resolved exactly once at flush, not lazily on every access.
+        assert calls[0] == 1
+
+    async def test_transaction_flush_resolves_lazy_values(self, session):
+        class Doc(BaseDocument):
+            systemTime: int
+
+        c = _ClientWithDoc("http://192.168.1.1", session=session, document_class=Doc)
+
+        async with c.transaction():
+            await c.set_many(systemTime=lambda: 1750000123)
+
+        call_args = session.post.call_args_list[-1]
+        data = call_args[1].get("data") or call_args[1].get("json", {})
+        assert data["systemTime"] == 1750000123
+
+
+class TestCrossComponentExceptionState:
+    """Our own write path refuses to lower currentSet below an active schedule limit,
+    but the firmware can hold such a state when configured externally; refresh must
+    flag the dependent component rather than raise."""
+
+    async def test_refresh_flags_schedule_limit_on_breach(self, session):
+        main_fetches = 0
+
+        async def post(url: str, *args: object, **kwargs: object) -> MagicMock:
+            nonlocal main_fetches
+            response = MagicMock()
+            if "init" in url:
+                data = {}
+            else:
+                main_fetches += 1
+                # Second fetch simulates currentSet being lowered on the device itself.
+                data = (
+                    {"currentSet": 32, "sh1CurrentValue": 30}
+                    if main_fetches == 1
+                    else {"currentSet": 27, "sh1CurrentValue": 30}
+                )
+            response.json = AsyncMock(return_value=data)
+            response.raise_for_status = MagicMock()
+            return response
+
+        session.post = post
+        client = Version_01("http://192.168.1.1", session=session)
+        await client.get_document()
+
+        node = client.device.schedules[0].current_limit._node  # type: ignore[reportAttributeAccessIssue]
+        assert not node.in_exception_state
+
+        await client.refresh()
+        assert node.in_exception_state
+        assert "greater than device limit" in str(node.exceptions[0])
